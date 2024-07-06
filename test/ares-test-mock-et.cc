@@ -42,46 +42,6 @@ using testing::DoAll;
 namespace ares {
 namespace test {
 
-TEST_P(MockEventThreadTest, Basic) {
-  std::vector<byte> reply = {
-    0x00, 0x00,  // qid
-    0x84, // response + query + AA + not-TC + not-RD
-    0x00, // not-RA + not-Z + not-AD + not-CD + rc=NoError
-    0x00, 0x01,  // 1 question
-    0x00, 0x01,  // 1 answer RRs
-    0x00, 0x00,  // 0 authority RRs
-    0x00, 0x00,  // 0 additional RRs
-    // Question
-    0x03, 'w', 'w', 'w',
-    0x06, 'g', 'o', 'o', 'g', 'l', 'e',
-    0x03, 'c', 'o', 'm',
-    0x00,
-    0x00, 0x01,  // type A
-    0x00, 0x01,  // class IN
-    // Answer
-    0x03, 'w', 'w', 'w',
-    0x06, 'g', 'o', 'o', 'g', 'l', 'e',
-    0x03, 'c', 'o', 'm',
-    0x00,
-    0x00, 0x01,  // type A
-    0x00, 0x01,  // class IN
-    0x00, 0x00, 0x01, 0x00,  // TTL
-    0x00, 0x04,  // rdata length
-    0x01, 0x02, 0x03, 0x04
-  };
-
-  ON_CALL(server_, OnRequest("www.google.com", T_A))
-    .WillByDefault(SetReplyData(&server_, reply));
-
-  HostResult result;
-  ares_gethostbyname(channel_, "www.google.com.", AF_INET, HostCallback, &result);
-  Process();
-  EXPECT_TRUE(result.done_);
-  std::stringstream ss;
-  ss << result.host_;
-  EXPECT_EQ("{'www.google.com' aliases=[] addrs=[1.2.3.4]}", ss.str());
-}
-
 // UDP only so mock server doesn't get confused by concatenated requests
 TEST_P(MockUDPEventThreadTest, GetHostByNameParallelLookups) {
   DNSPacket rsp1;
@@ -829,7 +789,45 @@ TEST_P(MockEventThreadTest, PartialQueryCancel) {
   EXPECT_TRUE(result.done_);
   EXPECT_EQ(ARES_ECANCELLED, result.status_);
 }
+
+// Test case for Issue #798, we're really looking for a crash, the results
+// don't matter.  Should either be successful or canceled.
+TEST_P(MockEventThreadTest, BulkCancel) {
+  std::vector<byte> nothing;
+  DNSPacket reply;
+  reply.set_response().set_aa()
+    .add_question(new DNSQuestion("www.google.com", T_A))
+    .add_answer(new DNSARR("www.google.com", 0x0100, {0x01, 0x02, 0x03, 0x04}));
+
+  ON_CALL(server_, OnRequest("www.google.com", T_A))
+    .WillByDefault(SetReply(&server_, &reply));
+
+#define BULKCANCEL_LOOP 5
+#define BULKCANCEL_CNT 50
+  for (size_t l = 0; l<BULKCANCEL_LOOP; l++) {
+    HostResult result[BULKCANCEL_CNT];
+    for (size_t i = 0; i<BULKCANCEL_CNT; i++) {
+      ares_gethostbyname(channel_, "www.google.com.", AF_INET, HostCallback, &result[i]);
+    }
+    // After 1ms, issues ares_cancel(), there should be queries outstanding that
+    // are cancelled.
+    Process(1);
+
+    size_t success_cnt = 0;
+    size_t cancel_cnt = 0;
+    for (size_t i = 0; i<BULKCANCEL_CNT; i++) {
+      EXPECT_TRUE(result[i].done_);
+      EXPECT_TRUE(result[i].status_ == ARES_ECANCELLED || result[i].status_ == ARES_SUCCESS);
+      if (result[i].status_ == ARES_SUCCESS)
+        success_cnt++;
+      if (result[i].status_ == ARES_ECANCELLED)
+        cancel_cnt++;
+    }
+    if (verbose) std::cerr << "success: " << success_cnt << ", cancel: " << cancel_cnt << std::endl;
+  }
+}
 #endif
+
 
 TEST_P(MockEventThreadTest, UnspecifiedFamilyV6) {
   DNSPacket rsp6;

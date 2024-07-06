@@ -111,6 +111,7 @@ typedef struct ares_rand_state ares_rand_state;
 #include "ares__htable_szvp.h"
 #include "ares__htable_asvp.h"
 #include "ares__htable_vpvp.h"
+#include "ares_dns_multistring.h"
 #include "ares__buf.h"
 #include "ares_dns_private.h"
 #include "ares__iface_ips.h"
@@ -254,9 +255,8 @@ struct query {
   /* connection handle query is associated with */
   struct server_connection *conn;
 
-  /* Arguments passed to ares_send() */
-  unsigned char            *qbuf;
-  size_t                    qlen;
+  /* Query */
+  ares_dns_record_t        *query;
 
   ares_callback_dnsrec      callback;
   void                     *arg;

@@ -58,6 +58,7 @@ extern "C" {
 
 #include <functional>
 #include <sstream>
+#include <algorithm>
 
 #ifdef WIN32
 #define BYTE_CAST (char *)
@@ -431,6 +432,7 @@ void DefaultChannelModeTest::Process(unsigned int cancel_ms) {
 
 MockServer::MockServer(int family, unsigned short port)
   : udpport_(port), tcpport_(port), qid_(-1) {
+  reply_ = nullptr;
   // Create a TCP socket to receive data on.
   tcp_data_ = NULL;
   tcp_data_len_ = 0;
@@ -570,21 +572,22 @@ void MockServer::ProcessPacket(ares_socket_t fd, struct sockaddr_storage *addr, 
   }
   if (enclen > qlen) {
     std::cerr << "(error, encoded name len " << enclen << "bigger than remaining data " << qlen << " bytes)" << std::endl;
+    ares_free_string(name);
     return;
   }
   qlen -= (int)enclen;
   question += enclen;
-  std::string namestr(name);
-  ares_free_string(name);
 
   if (qlen < 4) {
     std::cerr << "Unexpected question size (" << qlen
               << " bytes after name)" << std::endl;
+    ares_free_string(name);
     return;
   }
   if (DNS_QUESTION_CLASS(question) != C_IN) {
     std::cerr << "Unexpected question class (" << DNS_QUESTION_CLASS(question)
               << ")" << std::endl;
+    ares_free_string(name);
     return;
   }
   int rrtype = DNS_QUESTION_TYPE(question);
@@ -595,11 +598,11 @@ void MockServer::ProcessPacket(ares_socket_t fd, struct sockaddr_storage *addr, 
     std::cerr << "received " << (fd == udpfd_ ? "UDP" : "TCP") << " request " << reqstr
               << " on port " << (fd == udpfd_ ? udpport_ : tcpport_)
               << ":" << getaddrport(addr) << std::endl;
-    std::cerr << "ProcessRequest(" << qid << ", '" << namestr
+    std::cerr << "ProcessRequest(" << qid << ", '" << name
               << "', " << RRTypeToString(rrtype) << ")" << std::endl;
   }
-  ProcessRequest(fd, addr, addrlen, reqstr, qid, namestr, rrtype);
-
+  ProcessRequest(fd, addr, addrlen, reqstr, qid, name, rrtype);
+  ares_free_string(name);
 }
 
 void MockServer::ProcessFD(ares_socket_t fd) {
@@ -667,24 +670,32 @@ std::set<ares_socket_t> MockServer::fds() const {
   return result;
 }
 
-
 void MockServer::ProcessRequest(ares_socket_t fd, struct sockaddr_storage* addr,
                                 ares_socklen_t addrlen, const std::string &reqstr,
-                                int qid, const std::string& name, int rrtype) {
+                                int qid, const char *name, int rrtype) {
+
+  /* DNS 0x20 will mix case, do case-insensitive matching of name in request */
+  char lower_name[256];
+  arestest_strtolower(lower_name, name, sizeof(lower_name));
+
   // Before processing, let gMock know the request is happening.
-  OnRequest(name, rrtype);
+  OnRequest(lower_name, rrtype);
 
   // If we are expecting a specific request then check it matches here.
   if (expected_request_.length() > 0) {
     ASSERT_EQ(expected_request_, reqstr);
   }
 
-  if (reply_.size() == 0) {
+  if (reply_ != nullptr) {
+    exact_reply_ = reply_->data(name);
+  }
+
+  if (exact_reply_.size() == 0) {
     return;
   }
 
   // Make a local copy of the current pending reply.
-  std::vector<byte> reply = reply_;
+  std::vector<byte> reply = exact_reply_;
 
   if (qid_ >= 0) {
     // Use the explicitly specified query ID.
@@ -788,6 +799,12 @@ MockChannelOptsTest::MockChannelOptsTest(int count,
     optmask |= ARES_OPT_QUERY_CACHE;
   }
 
+  /* Enable DNS0x20 by default. Need to also turn on default flag of EDNS */
+  if (!(optmask & ARES_OPT_FLAGS)) {
+    optmask |= ARES_OPT_FLAGS;
+    opts.flags = ARES_FLAG_DNS0x20|ARES_FLAG_EDNS;
+  }
+
   EXPECT_EQ(ARES_SUCCESS, ares_init_options(&channel_, &opts, optmask));
   EXPECT_NE(nullptr, channel_);
 
@@ -857,39 +874,37 @@ void MockChannelOptsTest::Process(unsigned int cancel_ms) {
               cancel_ms);
 }
 
-void MockEventThreadOptsTest::ProcessThread() {
+void MockEventThreadOptsTest::Process(unsigned int cancel_ms) {
   std::set<ares_socket_t> fds;
 
 #ifndef CARES_SYMBOL_HIDING
-  bool has_cancel_ms = false;
+  bool has_cancel_ms = (cancel_ms > 0)?true:false;
   ares_timeval_t tv_begin;
   ares_timeval_t tv_cancel;
 #endif
 
-  mutex.lock();
+#ifndef CARES_SYMBOL_HIDING
+  ares_timeval_t tv_now;
+  ares_timeval_t atv_remaining;
 
-  while (isup) {
+  if (has_cancel_ms) {
+    ares__tvnow(&tv_begin);
+    memcpy(&tv_cancel, &tv_begin, sizeof(tv_cancel));
+    if (verbose) std::cerr << "ares_cancel will be called after " << cancel_ms << "ms" << std::endl;
+    tv_cancel.sec  += (cancel_ms / 1000);
+    tv_cancel.usec += ((cancel_ms % 1000) * 1000);
+  }
+#else
+  if (cancel_ms) {
+    std::cerr << "library built with symbol hiding, can't test with cancel support" << std::endl;
+    return;
+  }
+#endif
+
+  while (ares_queue_active_queries(channel_)) {
     int nfds = 0;
     fd_set readers;
-#ifndef CARES_SYMBOL_HIDING
-    ares_timeval_t tv_now;
-    ares_timeval_t atv_remaining;
 
-    ares__tvnow(&tv_now);
-    if (cancel_ms_ && !has_cancel_ms) {
-      ares__tvnow(&tv_begin);
-      memcpy(&tv_cancel, &tv_begin, sizeof(tv_cancel));
-      if (verbose) std::cerr << "ares_cancel will be called after " << cancel_ms_ << "ms" << std::endl;
-      tv_cancel.sec  += (cancel_ms_ / 1000);
-      tv_cancel.usec += ((cancel_ms_ % 1000) * 1000);
-      has_cancel_ms = true;
-    }
-#else
-    if (cancel_ms_) {
-      std::cerr << "library built with symbol hiding, can't test with cancel support" << std::endl;
-      return;
-    }
-#endif
     struct timeval  tv;
 
     /* c-ares is using its own event thread, so we only need to monitor the
@@ -903,9 +918,15 @@ void MockEventThreadOptsTest::ProcessThread() {
       }
     }
 
+    /* We just always wait 20ms then recheck. Not doing any complex signaling. */
+    tv.tv_sec  = 0;
+    tv.tv_usec = 20000;
+
 #ifndef CARES_SYMBOL_HIDING
+    ares__tvnow(&tv_now);
+
+    unsigned int remaining_ms = 0;
     if (has_cancel_ms) {
-      unsigned int remaining_ms;
       ares__timeval_remaining(&atv_remaining,
                               &tv_now,
                               &tv_cancel);
@@ -913,17 +934,16 @@ void MockEventThreadOptsTest::ProcessThread() {
       if (remaining_ms == 0) {
         if (verbose) std::cerr << "Issuing ares_cancel()" << std::endl;
         ares_cancel(channel_);
-        cancel_ms_ = 0; /* Disable issuing cancel again */
+        cancel_ms = 0; /* Disable issuing cancel again */
         has_cancel_ms = false;
       }
     }
+
+    if (has_cancel_ms && remaining_ms < 20) {
+      tv.tv_usec = (int)remaining_ms * 1000;
+    }
 #endif
 
-    /* We just always wait 20ms then recheck. Not doing any complex signaling. */
-    tv.tv_sec  = 0;
-    tv.tv_usec = 20000;
-
-    mutex.unlock();
     if (select(nfds, &readers, nullptr, nullptr, &tv) < 0) {
       fprintf(stderr, "select() failed, errno %d\n", errno);
       return;
@@ -935,10 +955,7 @@ void MockEventThreadOptsTest::ProcessThread() {
         ProcessFD(fd);
       }
     }
-    mutex.lock();
   }
-  mutex.unlock();
-
 }
 
 std::ostream& operator<<(std::ostream& os, const HostResult& result) {
@@ -961,8 +978,13 @@ HostEnt::HostEnt(const struct hostent *hostent) : addrtype_(-1) {
   if (!hostent)
     return;
 
-  if (hostent->h_name)
-    name_ = hostent->h_name;
+  if (hostent->h_name) {
+    // DNS 0x20 may mix case, output as all lower for checks as the mixed case
+    // is really more of an internal thing
+    char lowername[256];
+    arestest_strtolower(lowername, hostent->h_name, sizeof(lowername));
+    name_ = lowername;
+  }
 
   if (hostent->h_aliases) {
     char** palias = hostent->h_aliases;
