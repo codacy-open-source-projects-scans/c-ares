@@ -78,6 +78,40 @@ TEST_P(MockUDPEventThreadTest, GetHostByNameParallelLookups) {
   EXPECT_EQ("{'www.google.com' aliases=[] addrs=[2.3.4.5]}", ss3.str());
 }
 
+// c-ares issue #819
+TEST_P(MockUDPEventThreadTest, BadLoopbackServerNoTimeouts) {
+  ares_set_servers_csv(channel_, "127.0.0.1:12345");
+#define BADLOOPBACK_TESTCNT 5
+  HostResult result[BADLOOPBACK_TESTCNT];
+  for (size_t i=0; i<BADLOOPBACK_TESTCNT; i++) {
+    ares_gethostbyname(channel_, "www.google.com.", AF_UNSPEC, HostCallback, &result[i]);
+  }
+  Process();
+  for (size_t i=0; i<BADLOOPBACK_TESTCNT; i++) {
+    EXPECT_TRUE(result[i].done_);
+
+    /* This test relies on the ICMP unreachable packet coming back on UDP connections
+     * when there is no listener on the other end.  Most OS's handle this properly,
+     * but not all.  For instance, Solaris 11 seems to not be compliant (it
+     * does however honor it sometimes, just not always) so while we still run
+     * the test, we don't do a strict validation of the result.
+     *
+     * Windows also appears to have intermittent issues, AppVeyor fails but GitHub Actions
+     * succeeds, which seems strange.  This test goes to loopback so the network
+     * it resides on shouldn't matter.
+     *
+     * This test is really just testing an optimization, UDP is connectionless so you
+     * should expect most connections to rely on timeouts and not ICMP unreachable.
+     */
+# if defined(__sun) || defined(_WIN32)
+    EXPECT_TRUE(result[i].status_ == ARES_ECONNREFUSED || result[i].status_ == ARES_ETIMEOUT || result[i].status_ == ARES_ESERVFAIL);
+# else
+    EXPECT_EQ(ARES_ECONNREFUSED, result[i].status_);
+    EXPECT_EQ(0, result[i].timeouts_);
+#endif
+  }
+}
+
 // UDP to TCP specific test
 TEST_P(MockUDPEventThreadTest, TruncationRetry) {
   DNSPacket rsptruncated;
@@ -103,8 +137,8 @@ static int sock_cb_count = 0;
 static int SocketConnectCallback(ares_socket_t fd, int type, void *data) {
   int rc = *(int*)data;
   (void)type;
-  if (verbose) std::cerr << "SocketConnectCallback(" << fd << ") invoked" << std::endl;
   sock_cb_count++;
+  if (verbose) std::cerr << "SocketConnectCallback(fd: " << fd << ", cnt: " << sock_cb_count << ") invoked" << std::endl;
   return rc;
 }
 
@@ -214,6 +248,55 @@ TEST_P(MockUDPEventThreadMaxQueriesTest, GetHostByNameParallelLookups) {
     EXPECT_EQ("{'www.google.com' aliases=[] addrs=[2.3.4.5]}", ss.str());
   }
 }
+
+class MockUDPEventThreadSingleQueryPerConnTest
+    : public MockEventThreadOptsTest,
+      public ::testing::WithParamInterface<std::tuple<ares_evsys_t,int>> {
+ public:
+  MockUDPEventThreadSingleQueryPerConnTest()
+    : MockEventThreadOptsTest(1, std::get<0>(GetParam()), std::get<1>(GetParam()), false,
+                          FillOptions(&opts_),
+                          ARES_OPT_UDP_MAX_QUERIES) {}
+  static struct ares_options* FillOptions(struct ares_options * opts) {
+    memset(opts, 0, sizeof(struct ares_options));
+    opts->udp_max_queries = 1;
+    return opts;
+  }
+ private:
+  struct ares_options opts_;
+};
+
+#define LOTSOFCONNECTIONS_CNT 64
+TEST_P(MockUDPEventThreadSingleQueryPerConnTest, LotsOfConnections) {
+  DNSPacket rsp;
+  rsp.set_response().set_aa()
+    .add_question(new DNSQuestion("www.google.com", T_A))
+    .add_answer(new DNSARR("www.google.com", 100, {2, 3, 4, 5}));
+  ON_CALL(server_, OnRequest("www.google.com", T_A))
+    .WillByDefault(SetReply(&server_, &rsp));
+
+  // Get notified of new sockets so we can validate how many are created
+  int rc = ARES_SUCCESS;
+  ares_set_socket_callback(channel_, SocketConnectCallback, &rc);
+  sock_cb_count = 0;
+
+  HostResult result[LOTSOFCONNECTIONS_CNT];
+  for (size_t i=0; i<LOTSOFCONNECTIONS_CNT; i++) {
+    ares_gethostbyname(channel_, "www.google.com.", AF_INET, HostCallback, &result[i]);
+  }
+
+  Process();
+
+  EXPECT_EQ(LOTSOFCONNECTIONS_CNT, sock_cb_count);
+
+  for (size_t i=0; i<LOTSOFCONNECTIONS_CNT; i++) {
+    std::stringstream ss;
+    EXPECT_TRUE(result[i].done_);
+    ss << result[i].host_;
+    EXPECT_EQ("{'www.google.com' aliases=[] addrs=[2.3.4.5]}", ss.str());
+  }
+}
+
 
 class CacheQueriesEventThreadTest
     : public MockEventThreadOptsTest,
@@ -325,7 +408,7 @@ TEST_P(MockTCPEventThreadTest, MalformedResponse) {
   ares_gethostbyname(channel_, "www.google.com.", AF_INET, HostCallback, &result);
   Process();
   EXPECT_TRUE(result.done_);
-  EXPECT_EQ(ARES_ETIMEOUT, result.status_);
+  EXPECT_EQ(ARES_EBADRESP, result.status_);
 }
 
 TEST_P(MockTCPEventThreadTest, FormErrResponse) {
@@ -817,9 +900,9 @@ TEST_P(MockEventThreadTest, BulkCancel) {
     for (size_t i = 0; i<BULKCANCEL_CNT; i++) {
       EXPECT_TRUE(result[i].done_);
       EXPECT_TRUE(result[i].status_ == ARES_ECANCELLED || result[i].status_ == ARES_SUCCESS);
-      if (result[i].status_ == ARES_SUCCESS)
+      if (result[i].done_ && result[i].status_ == ARES_SUCCESS)
         success_cnt++;
-      if (result[i].status_ == ARES_ECANCELLED)
+      if (result[i].done_ && result[i].status_ == ARES_ECANCELLED)
         cancel_cnt++;
     }
     if (verbose) std::cerr << "success: " << success_cnt << ", cancel: " << cancel_cnt << std::endl;
@@ -1490,6 +1573,9 @@ INSTANTIATE_TEST_SUITE_P(AddressFamilies, MockEDNSEventThreadTest, ::testing::Va
 INSTANTIATE_TEST_SUITE_P(TransportModes, NoRotateMultiMockEventThreadTest, ::testing::ValuesIn(ares::test::evsys_families_modes), ares::test::PrintEvsysFamilyMode);
 
 INSTANTIATE_TEST_SUITE_P(TransportModes, ServerFailoverOptsMockEventThreadTest, ::testing::ValuesIn(ares::test::evsys_families_modes), ares::test::PrintEvsysFamilyMode);
+
+INSTANTIATE_TEST_SUITE_P(AddressFamilies, MockUDPEventThreadSingleQueryPerConnTest, ::testing::ValuesIn(ares::test::evsys_families), ares::test::PrintEvsysFamily);
+
 
 }  // namespace test
 }  // namespace ares

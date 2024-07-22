@@ -81,7 +81,7 @@ static ares_status_t ares_apply_dns0x20(ares_channel_t *channel,
     size_t bit;
 
     /* Only apply 0x20 to alpha characters */
-    if (!isalpha(name[i])) {
+    if (!ares__isalpha(name[i])) {
       dns0x20name[i] = name[i];
       continue;
     }
@@ -145,11 +145,11 @@ ares_status_t ares_send_nolock(ares_channel_t          *channel,
   query->using_tcp    = (channel->flags & ARES_FLAG_USEVC)?ARES_TRUE:ARES_FALSE;
 
   /* Duplicate Query */
-  query->query = ares_dns_record_duplicate(dnsrec);
-  if (query->query == NULL) {
+  status = ares_dns_record_duplicate_ex(&query->query, dnsrec);
+  if (status != ARES_SUCCESS) {
     ares_free(query);
-    callback(arg, ARES_ENOMEM, 0, NULL);
-    return ARES_ENOMEM;
+    callback(arg, status, 0, NULL);
+    return status;
   }
 
   ares_dns_record_set_id(query->query, id);

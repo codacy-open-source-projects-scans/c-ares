@@ -197,6 +197,21 @@ TEST_P(MockUDPChannelTest, TruncationRetry) {
   EXPECT_EQ("{'www.google.com' aliases=[] addrs=[1.2.3.4]}", ss.str());
 }
 
+TEST_P(MockUDPChannelTest, UTF8BadName) {
+  DNSPacket reply;
+  reply.set_response().set_aa()
+    .add_question(new DNSQuestion("españa.icom.museum", T_A))
+    .add_answer(new DNSARR("españa.icom.museum", 100, {2, 3, 4, 5}));
+  ON_CALL(server_, OnRequest("españa.icom.museum", T_A))
+    .WillByDefault(SetReply(&server_, &reply));
+
+  HostResult result;
+  ares_gethostbyname(channel_, "españa.icom.museum", AF_INET, HostCallback, &result);
+  Process();
+  EXPECT_TRUE(result.done_);
+  EXPECT_EQ(ARES_EBADNAME, result.status_);
+}
+
 static int sock_cb_count = 0;
 static int SocketConnectCallback(ares_socket_t fd, int type, void *data) {
   int rc = *(int*)data;
@@ -572,7 +587,7 @@ TEST_P(MockTCPChannelTest, MalformedResponse) {
   ares_gethostbyname(channel_, "www.google.com.", AF_INET, HostCallback, &result);
   Process();
   EXPECT_TRUE(result.done_);
-  EXPECT_EQ(ARES_ETIMEOUT, result.status_);
+  EXPECT_EQ(ARES_EBADRESP, result.status_);
 }
 
 TEST_P(MockTCPChannelTest, FormErrResponse) {
