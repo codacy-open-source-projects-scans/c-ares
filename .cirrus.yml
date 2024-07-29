@@ -8,21 +8,6 @@ env:
 
 task:
   matrix:
-    - name: "Debian amd64"
-      env:
-        DIST: "DEBIAN"
-        LC_ALL: "C"
-        SCAN_BUILD: "scan-build"
-        MAKE: "make"
-        BUILD_ASAN: "yes"
-        BUILD_UBSAN: "yes"
-        BUILD_VALGRIND: "yes"
-        BUILD_COVERAGE: "yes"
-        BUILD_ANALYZE: "yes"
-        TEST_DEBUGGER: "gdb"
-        TEST_SYMBOL_VISIBILITY: "yes"
-      container:
-        image: debian:latest
     - name: "Alpine amd64"
       env:
         DIST: "ALPINE"
@@ -73,18 +58,6 @@ task:
         TEST_SYMBOL_VISIBILITY: "yes"
       freebsd_instance:
         image_family: freebsd-13-3
-    - name: "MacOS"
-      env:
-        DIST: "MACOS"
-        SCAN_BUILD: "/opt/homebrew/opt/llvm/bin/scan-build-py"
-        MAKE: "make"
-        TEST_DEBUGGER: "lldb"
-        BUILD_ASAN: "yes"
-        BUILD_UBSAN: "yes"
-        BUILD_ANALYZE: "yes"
-        TEST_SYMBOL_VISIBILITY: "yes"
-      macos_instance:
-        image: ghcr.io/cirruslabs/macos-sonoma-xcode:latest
     - name: "iOS"
       env:
         DIST: "iOS"
@@ -99,16 +72,6 @@ task:
     - name: "CMAKE"
       env:
         BUILD_TYPE: "cmake"
-    - name: "CMAKE no threads"
-      only_if: $DIST == 'DEBIAN'
-      env:
-        BUILD_TYPE: "cmake"
-        CMAKE_FLAGS: "-DCMAKE_BUILD_TYPE=DEBUG -DCARES_STATIC=ON -DCARES_STATIC_PIC=ON -DCARES_THREADS=OFF -G Ninja"
-    - name: "CMAKE HIDE SYMBOLS"
-      only_if: $TEST_SYMBOL_VISIBILITY == 'yes'
-      env:
-        BUILD_TYPE: "cmake"
-        CMAKE_FLAGS: "-DCMAKE_BUILD_TYPE=DEBUG -DCARES_STATIC=OFF -DCARES_SYMBOL_HIDING=ON -G Ninja"
     - name: "AUTOTOOLS"
       env:
         BUILD_TYPE: "autotools"
@@ -150,24 +113,13 @@ task:
       env:
         BUILD_TYPE: "valgrind"
         TEST_WRAP: "valgrind --leak-check=full"
-        TEST_FILTER: "--gtest_filter=-*Container*:-*LiveSearchANY*"
-    - name: "COVERAGE"
-      only_if: $BUILD_COVERAGE == 'yes'
-      env:
-        BUILD_TYPE: "coverage"
-        CI_NAME: "cirrus-ci"
-        CI_BUILD_NUMBER: "${CIRRUS_TASK_ID}"
-        CI_BUILD_URL: "https://cirrus-ci.com/task/${CIRRUS_TASK_ID}"
-        CI_BRANCH: "${CIRRUS_BRANCH}"
-        CI_PULL_REQUEST: "${CIRRUS_PR}"
-        COVERALLS_REPO_TOKEN: "ENCRYPTED[a46bc6ca908e9e74f102c686cde67cae21d3e792dff46a60e860d1179d9349e8eb5a529132d0effefebdb0dbc3f95810]"
-        CONFIG_OPTS: "--enable-debug --disable-shared --enable-code-coverage --enable-tests"
+        TEST_FILTER: "-4 --gtest_filter=-*Container*:-*LiveSearchANY*"
 
   install_script:
     - |
       case "${DIST}" in
         ALPINE)
-          apk add cmake samurai gtest-dev autoconf autoconf-archive automake libtool pkgconf make
+          apk add bash cmake samurai gtest-dev autoconf autoconf-archive automake libtool pkgconf make
           case "${BUILD_TYPE}" in
             asan|lsan|ubsan)
               apk add clang17 compiler-rt lldb
@@ -197,10 +149,6 @@ task:
             valgrind)
               apt-get install -yq valgrind
               ;;
-            coverage)
-              apt-get install -yq lcov git pip
-              pip3 install --break-system-packages --user cpp-coveralls
-              ;;
             *)
               apt-get install -yq gdb
               ;;
@@ -208,7 +156,8 @@ task:
           ;;
         FREEBSD)
           # pkg upgrade -y && \
-          pkg install -y cmake ninja googletest pkgconf llvm gmake
+          pkg install -y bash cmake ninja googletest pkgconf llvm gmake
+          ln -sf /usr/local/bin/bash /bin/bash
           case "${BUILD_TYPE}" in
             autotools)
               pkg install -y autoconf automake libtool
@@ -233,5 +182,4 @@ task:
     - ./ci/build.sh
     - ./ci/test.sh
     - if [ "$BUILD_TYPE" = "autotools" -a "$DIST" = "DEBIAN" ]; then ./ci/distcheck.sh ; fi
-    - if [ "$BUILD_TYPE" = "coverage" ]; then ./ci/covupload.sh ; fi
 

@@ -29,7 +29,7 @@
 #include <assert.h>
 
 static void ares__requeue_queries(struct server_connection *conn,
-                                  ares_status_t requeue_status)
+                                  ares_status_t             requeue_status)
 {
   struct query  *query;
   ares_timeval_t now;
@@ -37,12 +37,12 @@ static void ares__requeue_queries(struct server_connection *conn,
   ares__tvnow(&now);
 
   while ((query = ares__llist_first_val(conn->queries_to_conn)) != NULL) {
-    ares__requeue_query(query, &now, requeue_status);
+    ares__requeue_query(query, &now, requeue_status, ARES_TRUE);
   }
 }
 
 void ares__close_connection(struct server_connection *conn,
-                            ares_status_t requeue_status)
+                            ares_status_t             requeue_status)
 {
   struct server_state *server  = conn->server;
   ares_channel_t      *channel = server->channel;
@@ -91,7 +91,6 @@ void ares__check_cleanup_conns(const ares_channel_t *channel)
   /* Iterate across each server */
   for (snode = ares__slist_node_first(channel->servers); snode != NULL;
        snode = ares__slist_node_next(snode)) {
-
     struct server_state *server = ares__slist_node_val(snode);
     ares__llist_node_t  *cnode;
 
@@ -101,7 +100,7 @@ void ares__check_cleanup_conns(const ares_channel_t *channel)
       ares__llist_node_t       *next       = ares__llist_node_next(cnode);
       struct server_connection *conn       = ares__llist_node_val(cnode);
       ares_bool_t               do_cleanup = ARES_FALSE;
-      cnode = next;
+      cnode                                = next;
 
       /* Has connections, not eligible */
       if (ares__llist_len(conn->queries_to_conn)) {
