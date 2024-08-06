@@ -12,7 +12,7 @@ INCLUDE (CheckCSourceCompiles)
 INCLUDE (CheckStructHasMember)
 INCLUDE (CheckLibraryExists)
 
-PROJECT (c-ares LANGUAGES C VERSION "1.32.3" )
+PROJECT (c-ares LANGUAGES C VERSION "1.33.0" )
 
 # Set this version before release
 SET (CARES_VERSION "${PROJECT_VERSION}")
@@ -30,7 +30,7 @@ INCLUDE (GNUInstallDirs) # include this *AFTER* PROJECT(), otherwise paths are w
 # For example, a version of 4:0:2 would generate output such as:
 #    libname.so   -> libname.so.2
 #    libname.so.2 -> libname.so.2.2.0
-SET (CARES_LIB_VERSIONINFO "19:3:17")
+SET (CARES_LIB_VERSIONINFO "20:0:18")
 
 
 OPTION (CARES_STATIC        "Build as a static library"                                             OFF)
@@ -410,6 +410,7 @@ CHECK_STRUCT_HAS_MEMBER("struct sockaddr_in6" sin6_scope_id "${CMAKE_EXTRA_INCLU
 CHECK_SYMBOL_EXISTS (closesocket     "${CMAKE_EXTRA_INCLUDE_FILES}" HAVE_CLOSESOCKET)
 CHECK_SYMBOL_EXISTS (CloseSocket     "${CMAKE_EXTRA_INCLUDE_FILES}" HAVE_CLOSESOCKET_CAMEL)
 CHECK_SYMBOL_EXISTS (connect         "${CMAKE_EXTRA_INCLUDE_FILES}" HAVE_CONNECT)
+CHECK_SYMBOL_EXISTS (connectx        "${CMAKE_EXTRA_INCLUDE_FILES}" HAVE_CONNECTX)
 CHECK_SYMBOL_EXISTS (fcntl           "${CMAKE_EXTRA_INCLUDE_FILES}" HAVE_FCNTL)
 CHECK_SYMBOL_EXISTS (freeaddrinfo    "${CMAKE_EXTRA_INCLUDE_FILES}" HAVE_FREEADDRINFO)
 CHECK_SYMBOL_EXISTS (getaddrinfo     "${CMAKE_EXTRA_INCLUDE_FILES}" HAVE_GETADDRINFO)
@@ -424,6 +425,10 @@ CHECK_SYMBOL_EXISTS (if_indextoname  "${CMAKE_EXTRA_INCLUDE_FILES}" HAVE_IF_INDE
 CHECK_SYMBOL_EXISTS (if_nametoindex  "${CMAKE_EXTRA_INCLUDE_FILES}" HAVE_IF_NAMETOINDEX)
 CHECK_SYMBOL_EXISTS (ConvertInterfaceIndexToLuid  "${CMAKE_EXTRA_INCLUDE_FILES}" HAVE_CONVERTINTERFACEINDEXTOLUID)
 CHECK_SYMBOL_EXISTS (ConvertInterfaceLuidToNameA  "${CMAKE_EXTRA_INCLUDE_FILES}" HAVE_CONVERTINTERFACELUIDTONAMEA)
+CHECK_SYMBOL_EXISTS (NotifyIpInterfaceChange      "${CMAKE_EXTRA_INCLUDE_FILES}" HAVE_NOTIFYIPINTERFACECHANGE)
+CHECK_SYMBOL_EXISTS (RegisterWaitForSingleObject  "${CMAKE_EXTRA_INCLUDE_FILES}" HAVE_REGISTERWAITFORSINGLEOBJECT)
+
+
 CHECK_SYMBOL_EXISTS (inet_net_pton   "${CMAKE_EXTRA_INCLUDE_FILES}" HAVE_INET_NET_PTON)
 IF (NOT WIN32)
 	# Disabled on Windows, because these functions are only really supported on Windows
