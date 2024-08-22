@@ -213,8 +213,12 @@ ares_status_t ares__buf_append(ares__buf_t *buf, const unsigned char *data,
 {
   ares_status_t status;
 
-  if (data == NULL || data_len == 0) {
+  if (data == NULL && data_len != 0) {
     return ARES_EFORMERR;
+  }
+
+  if (data_len == 0) {
+    return ARES_SUCCESS;
   }
 
   status = ares__buf_ensure_space(buf, data_len);
@@ -1234,7 +1238,7 @@ ares_status_t ares__buf_load_file(const char *filename, ares__buf_t *buf)
 
   fp = fopen(filename, "rb");
   if (fp == NULL) {
-    int error = ERRNO;
+    int error = errno;
     switch (error) {
       case ENOENT:
       case ESRCH:
