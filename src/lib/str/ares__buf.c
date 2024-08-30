@@ -553,10 +553,18 @@ ares_status_t ares__buf_fetch_bytes_dup(ares__buf_t *buf, size_t len,
 ares_status_t ares__buf_fetch_str_dup(ares__buf_t *buf, size_t len, char **str)
 {
   size_t               remaining_len;
+  size_t               i;
   const unsigned char *ptr = ares__buf_fetch(buf, &remaining_len);
 
   if (buf == NULL || str == NULL || len == 0 || remaining_len < len) {
     return ARES_EBADRESP;
+  }
+
+  /* Validate string is printable */
+  for (i = 0; i < len; i++) {
+    if (!ares__isprint(ptr[i])) {
+      return ARES_EBADSTR;
+    }
   }
 
   *str = ares_malloc(len + 1);
@@ -804,7 +812,7 @@ ares_status_t ares__buf_split(ares__buf_t *buf, const unsigned char *delims,
       /* No delimiter yet, just tag the start */
       ares__buf_tag(buf);
     } else {
-      if (flags & ARES_BUF_SPLIT_DONT_CONSUME_DELIMS) {
+      if (flags & ARES_BUF_SPLIT_KEEP_DELIMS) {
         /* tag then eat delimiter so its first byte in buffer */
         ares__buf_tag(buf);
         ares__buf_consume(buf, 1);
@@ -884,6 +892,67 @@ done:
   return status;
 }
 
+static void ares__free_split_array(void *arg)
+{
+  void **ptr = arg;
+  ares_free(*ptr);
+}
+
+ares_status_t ares__buf_split_str(ares__buf_t *buf, const unsigned char *delims,
+                                  size_t delims_len, ares__buf_split_t flags,
+                                  size_t max_sections, char ***strs,
+                                  size_t *nstrs)
+{
+  ares_status_t       status;
+  ares__llist_t      *list = NULL;
+  ares__llist_node_t *node;
+  ares__array_t      *arr = NULL;
+
+  if (strs == NULL || nstrs == NULL) {
+    return ARES_EFORMERR;
+  }
+
+  *strs  = NULL;
+  *nstrs = 0;
+
+  status = ares__buf_split(buf, delims, delims_len, flags, max_sections, &list);
+  if (status != ARES_SUCCESS) {
+    goto done;
+  }
+
+  arr = ares__array_create(sizeof(char *), ares__free_split_array);
+  if (arr == NULL) {
+    status = ARES_ENOMEM;
+    goto done;
+  }
+
+  for (node = ares__llist_node_first(list); node != NULL;
+       node = ares__llist_node_next(node)) {
+    ares__buf_t *lbuf = ares__llist_node_val(node);
+    char        *str  = NULL;
+
+    status = ares__buf_fetch_str_dup(lbuf, ares__buf_len(lbuf), &str);
+    if (status != ARES_SUCCESS) {
+      goto done;
+    }
+
+    status = ares__array_insertdata_last(arr, &str);
+    if (status != ARES_SUCCESS) {
+      ares_free(str);
+      goto done;
+    }
+  }
+
+done:
+  ares__llist_destroy(list);
+  if (status == ARES_SUCCESS) {
+    *strs = ares__array_finish(arr, nstrs);
+  } else {
+    ares__array_destroy(arr);
+  }
+  return status;
+}
+
 ares_bool_t ares__buf_begins_with(const ares__buf_t   *buf,
                                   const unsigned char *data, size_t data_len)
 {
@@ -939,76 +1008,6 @@ ares_status_t ares__buf_set_position(ares__buf_t *buf, size_t idx)
 
   buf->offset = idx;
   return ARES_SUCCESS;
-}
-
-ares_status_t ares__buf_parse_dns_abinstr(ares__buf_t *buf,
-                                          size_t       remaining_len,
-                                          ares__dns_multistring_t **strs,
-                                          ares_bool_t validate_printable)
-{
-  unsigned char len;
-  ares_status_t status   = ARES_EBADRESP;
-  size_t        orig_len = ares__buf_len(buf);
-
-  if (buf == NULL) {
-    return ARES_EFORMERR;
-  }
-
-  if (remaining_len == 0) {
-    return ARES_EBADRESP;
-  }
-
-  if (strs != NULL) {
-    *strs = ares__dns_multistring_create();
-    if (*strs == NULL) {
-      return ARES_ENOMEM;
-    }
-  }
-
-  while (orig_len - ares__buf_len(buf) < remaining_len) {
-    status = ares__buf_fetch_bytes(buf, &len, 1);
-    if (status != ARES_SUCCESS) {
-      break; /* LCOV_EXCL_LINE: DefensiveCoding */
-    }
-
-    if (len) {
-      /* When used by the _str() parser, it really needs to be validated to
-       * be a valid printable ascii string.  Do that here */
-      if (validate_printable && ares__buf_len(buf) >= len) {
-        size_t      mylen;
-        const char *data = (const char *)ares__buf_peek(buf, &mylen);
-        if (!ares__str_isprint(data, len)) {
-          status = ARES_EBADSTR;
-          break;
-        }
-      }
-
-      if (strs != NULL) {
-        unsigned char *data = NULL;
-        status = ares__buf_fetch_bytes_dup(buf, len, ARES_TRUE, &data);
-        if (status != ARES_SUCCESS) {
-          break;
-        }
-        status = ares__dns_multistring_add_own(*strs, data, len);
-        if (status != ARES_SUCCESS) {
-          ares_free(data);
-          break;
-        }
-      } else {
-        status = ares__buf_consume(buf, len);
-        if (status != ARES_SUCCESS) {
-          break;
-        }
-      }
-    }
-  }
-
-  if (status != ARES_SUCCESS && strs != NULL) {
-    ares__dns_multistring_destroy(*strs);
-    *strs = NULL;
-  }
-
-  return status;
 }
 
 static ares_status_t

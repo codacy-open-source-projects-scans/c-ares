@@ -100,20 +100,21 @@ W32_FUNC const char *_w32_GetHostsFile(void);
 
 #endif
 
+#include "ares_mem.h"
 #include "ares_ipv6.h"
 
 struct ares_rand_state;
 typedef struct ares_rand_state ares_rand_state;
 
-#include "dsa/ares__array.h"
-#include "dsa/ares__llist.h"
+#include "ares__array.h"
+#include "ares__llist.h"
 #include "dsa/ares__slist.h"
-#include "dsa/ares__htable_strvp.h"
-#include "dsa/ares__htable_szvp.h"
-#include "dsa/ares__htable_asvp.h"
-#include "dsa/ares__htable_vpvp.h"
+#include "ares__htable_strvp.h"
+#include "ares__htable_szvp.h"
+#include "ares__htable_asvp.h"
+#include "ares__htable_vpvp.h"
 #include "record/ares_dns_multistring.h"
-#include "str/ares__buf.h"
+#include "ares__buf.h"
 #include "record/ares_dns_private.h"
 #include "util/ares__iface_ips.h"
 #include "util/ares__threads.h"
@@ -123,18 +124,8 @@ typedef struct ares_rand_state ares_rand_state;
 #  define getenv(ptr) ares_getenv(ptr)
 #endif
 
-#include "str/ares_str.h"
+#include "ares_str.h"
 #include "str/ares_strsplit.h"
-
-#ifndef HAVE_STRCASECMP
-#  include "str/ares_strcasecmp.h"
-#  define strcasecmp(p1, p2) ares_strcasecmp(p1, p2)
-#endif
-
-#ifndef HAVE_STRNCASECMP
-#  include "str/ares_strcasecmp.h"
-#  define strncasecmp(p1, p2, n) ares_strncasecmp(p1, p2, n)
-#endif
 
 /********* EDNS defines section ******/
 #define EDNSPACKETSZ                                          \
@@ -419,7 +410,7 @@ struct ares_channeldata {
   const struct ares_socket_functions *sock_funcs;
   void                               *sock_func_cb_data;
 
-  ares_notify_pending_write_callback  notify_pending_write_cb;
+  ares_pending_write_cb               notify_pending_write_cb;
   void                               *notify_pending_write_cb_data;
   ares_bool_t                         notify_pending_write;
 
@@ -467,14 +458,7 @@ struct ares_channeldata {
 };
 
 /* Does the domain end in ".onion" or ".onion."? Case-insensitive. */
-ares_bool_t ares__is_onion_domain(const char *name);
-
-/* Memory management functions */
-extern void *(*ares_malloc)(size_t size);
-extern void *(*ares_realloc)(void *ptr, size_t size);
-extern void (*ares_free)(void *ptr);
-void         *ares_malloc_zero(size_t size);
-void         *ares_realloc_zero(void *ptr, size_t orig_size, size_t new_size);
+ares_bool_t   ares__is_onion_domain(const char *name);
 
 /* return true if now is exactly check time or later */
 ares_bool_t   ares__timedout(const ares_timeval_t *now,
@@ -482,10 +466,14 @@ ares_bool_t   ares__timedout(const ares_timeval_t *now,
 
 /* Returns one of the normal ares status codes like ARES_SUCCESS */
 ares_status_t ares__send_query(ares_query_t *query, const ares_timeval_t *now);
-ares_status_t ares__requeue_query(ares_query_t         *query,
-                                  const ares_timeval_t *now,
-                                  ares_status_t         status,
-                                  ares_bool_t           inc_try_count);
+ares_status_t ares__requeue_query(ares_query_t            *query,
+                                  const ares_timeval_t    *now,
+                                  ares_status_t            status,
+                                  ares_bool_t              inc_try_count,
+                                  const ares_dns_record_t *dnsrec);
+
+/*! Count the number of labels (dots+1) in a domain */
+size_t        ares__name_label_cnt(const char *name);
 
 /*! Retrieve a list of names to use for searching.  The first successful
  *  query in the list wins.  This function also uses the HOSTSALIASES file
@@ -686,11 +674,11 @@ ares_status_t   ares__sconfig_append(ares__llist_t         **sconfig,
 ares_status_t   ares__sconfig_append_fromstr(ares__llist_t **sconfig,
                                              const char     *str,
                                              ares_bool_t     ignore_invalid);
-ares_status_t ares_in_addr_to_server_config_llist(const struct in_addr *servers,
-                                                  size_t          nservers,
-                                                  ares__llist_t **llist);
-ares_status_t ares_get_server_addr(const ares_server_t *server,
-                                   ares__buf_t         *buf);
+ares_status_t   ares_in_addr_to_sconfig_llist(const struct in_addr *servers,
+                                              size_t                nservers,
+                                              ares__llist_t       **llist);
+ares_status_t   ares_get_server_addr(const ares_server_t *server,
+                                     ares__buf_t         *buf);
 
 struct ares_hosts_entry;
 typedef struct ares_hosts_entry ares_hosts_entry_t;
