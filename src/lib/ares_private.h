@@ -52,11 +52,13 @@
 #include "ares_htable_szvp.h"
 #include "ares_htable_asvp.h"
 #include "ares_htable_vpvp.h"
+#include "ares_htable_vpstr.h"
 #include "record/ares_dns_multistring.h"
 #include "ares_buf.h"
 #include "record/ares_dns_private.h"
 #include "util/ares_iface_ips.h"
 #include "util/ares_threads.h"
+#include "ares_socket.h"
 #include "ares_conn.h"
 #include "ares_str.h"
 #include "str/ares_strsplit.h"
@@ -310,7 +312,8 @@ struct ares_channeldata {
 ares_bool_t   ares_is_onion_domain(const char *name);
 
 /* Returns one of the normal ares status codes like ARES_SUCCESS */
-ares_status_t ares_send_query(ares_query_t *query, const ares_timeval_t *now);
+ares_status_t ares_send_query(ares_server_t *requested_server /* Optional */,
+                              ares_query_t *query, const ares_timeval_t *now);
 ares_status_t ares_requeue_query(ares_query_t *query, const ares_timeval_t *now,
                                  ares_status_t            status,
                                  ares_bool_t              inc_try_count,
@@ -484,9 +487,17 @@ ares_status_t ares_query_nolock(ares_channel_t *channel, const char *name,
                                 ares_callback_dnsrec callback, void *arg,
                                 unsigned short *qid);
 
-/* Same as ares_send_dnsrec() except does not take a channel lock.  Use this
- * if a channel lock is already held */
-ares_status_t ares_send_nolock(ares_channel_t          *channel,
+/*! Flags controlling behavior for ares_send_nolock() */
+typedef enum {
+  ARES_SEND_FLAG_NOCACHE = 1 << 0, /*!< Do not query the cache */
+  ARES_SEND_FLAG_NORETRY = 1 << 1  /*!< Do not retry this query on error */
+} ares_send_flags_t;
+
+/* Similar to ares_send_dnsrec() except does not take a channel lock, allows
+ * specifying a particular server to use, and also flags controlling behavior.
+ */
+ares_status_t ares_send_nolock(ares_channel_t *channel, ares_server_t *server,
+                               ares_send_flags_t        flags,
                                const ares_dns_record_t *dnsrec,
                                ares_callback_dnsrec callback, void *arg,
                                unsigned short *qid);
