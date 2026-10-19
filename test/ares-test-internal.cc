@@ -421,6 +421,9 @@ TEST_F(LibraryTest, URI) {
     { ARES_TRUE,  "https://user%25:password@www.example.com",                                              NULL },
     { ARES_TRUE,  "https://user:password%25@www.example.com",                                              NULL },
     { ARES_TRUE,  "https://user@www.example.com",                                                          NULL },
+    { ARES_TRUE,  "https://user@www.example.com:8443",                                                     NULL },
+    { ARES_TRUE,  "dns://user@[fe80::1]:53",                                                               NULL },
+    { ARES_FALSE, "https://user@www.example.com:8443@evil.example.com",                                    NULL }, /* ambiguous authority, '@' not valid in host */
     { ARES_TRUE,  "https://www.example.com/path",                                                          NULL },
     { ARES_TRUE,  "https://www.example.com/path/",                                                         NULL },
     { ARES_TRUE,  "https://www.example.com/a/../",                                                         "https://www.example.com/" },
@@ -974,6 +977,41 @@ TEST_F(LibraryTest, SysConfigDomainsIDNA) {
   }
 }
 
+TEST_F(LibraryTest, SysConfigResolvInlineComments)
+{
+  const char resolvconf[] = "nameserver 1.2.3.4 # managed nameserver\n"
+                            "nameserver 2.3.4.5 ; managed nameserver\n"
+                            "search first.com second.com # ignored.example\n"
+                            "lookup bind ; file\n"
+                            "options ndots:5 ; ndots:9\n";
+  ares_sysconfig_t sysconfig;
+  ares_channel_t  *channel = nullptr;
+  ares_buf_t      *buf;
+
+  memset(&sysconfig, 0, sizeof(sysconfig));
+  buf = ares_buf_create_const((const unsigned char *)resolvconf,
+                              sizeof(resolvconf) - 1);
+  ASSERT_NE(nullptr, buf);
+  ASSERT_EQ(ARES_SUCCESS, ares_init(&channel));
+
+  EXPECT_EQ(ARES_SUCCESS,
+            ares_sysconfig_process_buf(channel, &sysconfig, buf,
+                                       ares_sysconfig_parse_resolv_line));
+  EXPECT_EQ((size_t)2, ares_llist_len(sysconfig.sconfig));
+  ASSERT_EQ((size_t)2, sysconfig.ndomains);
+  EXPECT_STREQ("first.com", sysconfig.domains[0]);
+  EXPECT_STREQ("second.com", sysconfig.domains[1]);
+  EXPECT_STREQ("b", sysconfig.lookups);
+  EXPECT_EQ((size_t)5, sysconfig.ndots);
+
+  ares_llist_destroy(sysconfig.sconfig);
+  ares_strsplit_free(sysconfig.domains, sysconfig.ndomains);
+  ares_free(sysconfig.sortlist);
+  ares_free(sysconfig.lookups);
+  ares_buf_destroy(buf);
+  ares_destroy(channel);
+}
+
 TEST_F(LibraryTest, BufCharset) {
   struct {
     ares_bool_t ascii_ok;
@@ -1197,6 +1235,59 @@ TEST_F(LibraryTest, BufCodepoint) {
     EXPECT_STREQ("good.com", out[0]);
     EXPECT_STREQ("bücher.de", out[1]);
     ares_strsplit_free(out, n);
+  }
+}
+
+// The cache key must distinguish requests whose answers are not
+// interchangeable.  Two shapes are easy to get wrong because names reach the
+// key unescaped: a request with two questions versus one whose name spells out
+// the second, and two requests with the same question count whose names can be
+// made to run together.  Both are narrow to reach -- they need a hand-built
+// record with more than one question, which real servers reject -- but the key
+// asserts they are distinct, so pin it.
+TEST_F(LibraryTest, QcacheKeyDistinguishesQuestions) {
+  struct qcase {
+    const char *n1;
+    const char *n2; /* nullptr for a single-question record */
+  };
+  const qcase cases[] = {
+    { "one.example.net",                      "two.example.net"                        },
+    { "one.example.net|A|IN|two.example.net", nullptr                                  },
+    { "one.example.net",                      "two.example.net|A|IN|three.example.net" },
+    { "one.example.net|A|IN|two.example.net", "three.example.net"                      },
+  };
+  std::vector<std::string> keys;
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    ares_dns_record_t *req = nullptr;
+    char              *key = nullptr;
+
+    EXPECT_EQ(ARES_SUCCESS,
+              ares_dns_record_create(&req, 0, ARES_FLAG_RD, ARES_OPCODE_QUERY,
+                                     ARES_RCODE_NOERROR));
+    EXPECT_EQ(ARES_SUCCESS,
+              ares_dns_record_query_add(req, cases[i].n1, ARES_REC_TYPE_A,
+                                        ARES_CLASS_IN));
+    if (cases[i].n2 != nullptr) {
+      EXPECT_EQ(ARES_SUCCESS,
+                ares_dns_record_query_add(req, cases[i].n2, ARES_REC_TYPE_A,
+                                          ARES_CLASS_IN));
+    }
+
+    key = ares_qcache_calc_key(req);
+    ASSERT_NE(nullptr, key);
+    keys.push_back(std::string(key));
+    ares_free_string(key);
+    ares_dns_record_destroy(req);
+  }
+
+  /* Every one of these is a different request, so every key must differ. */
+  for (size_t i = 0; i < keys.size(); i++) {
+    for (size_t j = i + 1; j < keys.size(); j++) {
+      EXPECT_NE(keys[i], keys[j])
+        << "cache key collision between case " << i << " and case " << j
+        << ": " << keys[i];
+    }
   }
 }
 
@@ -3368,6 +3459,108 @@ const struct ares_socket_functions VirtualizeIO::default_functions = {
   NULL
 };
 
+
+#ifndef CARES_SYMBOL_HIDING
+/* ---------------------------------------------------------------------------
+ * EBCDIC helpers unit tests (pure logic, no PASE dependency)
+ * -------------------------------------------------------------------------*/
+
+/* Spot-check the DNS/hostname charset slots in the EBCDIC->ASCII table
+ * that are critical for correct parsing of QtocRtvTCPA output. */
+TEST_F(LibraryTest, EbcdicTableDnsCharset) {
+  /* Letters a-z (0x81-0x89, 0x91-0x99, 0xA2-0xA9) */
+  EXPECT_EQ('a', ares_ebcdic_to_ascii_table[0x81]);
+  EXPECT_EQ('i', ares_ebcdic_to_ascii_table[0x89]);
+  EXPECT_EQ('j', ares_ebcdic_to_ascii_table[0x91]);
+  EXPECT_EQ('r', ares_ebcdic_to_ascii_table[0x99]);
+  EXPECT_EQ('s', ares_ebcdic_to_ascii_table[0xA2]);
+  EXPECT_EQ('z', ares_ebcdic_to_ascii_table[0xA9]);
+  /* Letters A-Z */
+  EXPECT_EQ('A', ares_ebcdic_to_ascii_table[0xC1]);
+  EXPECT_EQ('I', ares_ebcdic_to_ascii_table[0xC9]);
+  EXPECT_EQ('J', ares_ebcdic_to_ascii_table[0xD1]);
+  EXPECT_EQ('R', ares_ebcdic_to_ascii_table[0xD9]);
+  EXPECT_EQ('S', ares_ebcdic_to_ascii_table[0xE2]);
+  EXPECT_EQ('Z', ares_ebcdic_to_ascii_table[0xE9]);
+  /* Digits 0-9 */
+  EXPECT_EQ('0', ares_ebcdic_to_ascii_table[0xF0]);
+  EXPECT_EQ('9', ares_ebcdic_to_ascii_table[0xF9]);
+  /* Punctuation used in DNS hostnames and the search-list splitter */
+  EXPECT_EQ(' ', ares_ebcdic_to_ascii_table[0x40]); /* space */
+  EXPECT_EQ('.', ares_ebcdic_to_ascii_table[0x4B]); /* period */
+  EXPECT_EQ('-', ares_ebcdic_to_ascii_table[0x60]); /* hyphen */
+  EXPECT_EQ(',', ares_ebcdic_to_ascii_table[0x6B]); /* comma */
+  EXPECT_EQ('_', ares_ebcdic_to_ascii_table[0x6D]); /* underscore */
+}
+
+/* Test ares_ebcdic_to_ascii_str: single domain, no trailing padding */
+TEST_F(LibraryTest, EbcdicToAsciiStrSingleDomain) {
+  /* "corp.example.com" in CCSID 37 EBCDIC */
+  const char ebcdic[] = {
+    '\x83', '\x96', '\x99', '\x97', '\x4b',  /* c o r p . */
+    '\x85', '\xa7', '\x81', '\x94', '\x97',  /* e x a m p */
+    '\x93', '\x85', '\x4b',                  /* l e .     */
+    '\x83', '\x96', '\x94',                  /* c o m     */
+    '\0'
+  };
+  char out[32];
+  ares_ebcdic_to_ascii_str(ebcdic, sizeof(ebcdic) - 1, out);
+  EXPECT_STREQ("corp.example.com", out);
+}
+
+/* Test ares_ebcdic_to_ascii_str: stops at embedded NUL */
+TEST_F(LibraryTest, EbcdicToAsciiStrStopsAtNul) {
+  /* "ab\0cd" -- should produce "ab" */
+  const char ebcdic[] = { '\x81', '\x82', '\0', '\x83', '\x84' };
+  char out[10];
+  ares_ebcdic_to_ascii_str(ebcdic, sizeof(ebcdic), out);
+  EXPECT_STREQ("ab", out);
+}
+
+/* Convert a whole EBCDIC, space-separated, blank-padded search_list field and
+ * split it, exactly as ares_init_sysconfig_pase() does.  Exercises the table's
+ * 0x40 -> ' ' mapping and the whole-field (non-truncating) conversion. */
+TEST_F(LibraryTest, EbcdicSearchListSplit) {
+  /* "corp.example.com eng.example.com" in CCSID 37, blank(0x40)-padded */
+  const char ebcdic_field[48] = {
+    '\x83', '\x96', '\x99', '\x97', '\x4b', '\x85', '\xa7', '\x81',
+    '\x94', '\x97', '\x93', '\x85', '\x4b', '\x83', '\x96', '\x94',
+    '\x40', '\x85', '\x95', '\x87', '\x4b', '\x85', '\xa7', '\x81',
+    '\x94', '\x97', '\x93', '\x85', '\x4b', '\x83', '\x96', '\x94',
+    '\x40', '\x40', '\x40', '\x40', '\x40', '\x40', '\x40', '\x40',
+    '\x40', '\x40', '\x40', '\x40', '\x40', '\x40', '\x40', '\x40'
+  };
+  char   ascii[sizeof(ebcdic_field) + 1];
+  size_t n     = 0;
+  char **parts = nullptr;
+
+  ares_ebcdic_to_ascii_str(ebcdic_field, sizeof(ebcdic_field), ascii);
+  EXPECT_STREQ("corp.example.com eng.example.com                ", ascii);
+
+  parts = ares_strsplit(ascii, ", ", &n);
+  ASSERT_NE(nullptr, parts);
+  ASSERT_EQ((size_t)2, n);
+  EXPECT_STREQ("corp.example.com", parts[0]);
+  EXPECT_STREQ("eng.example.com", parts[1]);
+  ares_strsplit_free(parts, n);
+}
+
+/* An all-blank (EBCDIC 0x40) search_list field must yield no domains. */
+TEST_F(LibraryTest, EbcdicSearchListAllBlanks) {
+  char   ebcdic_field[16];
+  char   ascii[sizeof(ebcdic_field) + 1];
+  size_t n = 99;
+  char **parts;
+
+  memset(ebcdic_field, 0x40, sizeof(ebcdic_field));
+  ares_ebcdic_to_ascii_str(ebcdic_field, sizeof(ebcdic_field), ascii);
+  EXPECT_STREQ("                ", ascii);
+
+  parts = ares_strsplit(ascii, ", ", &n);
+  EXPECT_EQ(nullptr, parts);
+  EXPECT_EQ((size_t)0, n);
+}
+#endif /* !CARES_SYMBOL_HIDING */
 
 }  // namespace test
 }  // namespace ares
