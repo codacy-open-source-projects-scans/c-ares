@@ -282,6 +282,23 @@ TEST_F(LibraryTest, InetNetPtoN) {
   EXPECT_EQ(-1, ares_inet_net_pton(AF_INET, "253", &a4, sizeof(a4) - 1));
 }
 
+// An IPv6 network with a prefix length only carries (bits+7)/8 bytes; the
+// rest of the destination must be zeroed rather than left as it was.
+TEST_F(LibraryTest, InetNetPtoNPrefixZeroFills) {
+  unsigned char a6[16];
+
+  memset(a6, 0x41, sizeof(a6));
+  EXPECT_EQ(0, ares_inet_net_pton(AF_INET6, "::1/0", a6, sizeof(a6)));
+  EXPECT_EQ("0000:0000:0000:0000:0000:0000:0000:0000",
+            AddressToString(a6, 16));
+
+  memset(a6, 0x41, sizeof(a6));
+  EXPECT_EQ(64, ares_inet_net_pton(AF_INET6, "2001:db8:1:2:3:4:5:6/64", a6,
+                                   sizeof(a6)));
+  EXPECT_EQ("2001:0db8:0001:0002:0000:0000:0000:0000",
+            AddressToString(a6, 16));
+}
+
 TEST_F(LibraryTest, FreeLongChain) {
   struct ares_addr_node *data = nullptr;
   for (int ii = 0; ii < 100000; ii++) {
@@ -1300,7 +1317,44 @@ TEST_F(LibraryTest, InetPtoN) {
   EXPECT_EQ(1, ares_inet_pton(AF_INET6, "12:34::ff", &a6));
   EXPECT_EQ(1, ares_inet_pton(AF_INET6, "12:34::ffff:1.2.3.4", &a6));
   EXPECT_EQ(0, ares_inet_pton(AF_INET, "xyzzy", &a4));
+  // Too many octets is unparsable input, not a system error.
+  EXPECT_EQ(0, ares_inet_pton(AF_INET, "1.2.3.4.5", &a4));
+  EXPECT_EQ(0, ares_inet_pton(AF_INET, "0x0102030405", &a4));
   EXPECT_EQ(-1, ares_inet_pton(AF_INET+AF_INET6, "1.2.3.4", &a4));
+}
+
+// ares_inet_pton() parses addresses, not networks: like inet_pton(3) it must
+// reject a "/bits" prefix length.  It used to accept one and, for IPv6, write
+// only (bits+7)/8 bytes of dst while still returning 1.
+TEST_F(LibraryTest, InetPtoNRejectsPrefixLength) {
+  const char *cases6[] = { "::1/0", "ffff::1/16", "2001:db8::1/64",
+                           "2001:db8::1/128", "::ffff:1.2.3.4/8",
+                           "::ffff:1.2.3.4/32" };
+  const char *cases4[] = { "1.2.3.4/8", "1.2.3.4/0", "1.2.3.4/32", "10/8",
+                           "0x0a000000/8" };
+  unsigned char a4[4];
+  unsigned char a6[16];
+  size_t        i;
+
+  for (i = 0; i < sizeof(cases6) / sizeof(*cases6); i++) {
+    EXPECT_EQ(0, ares_inet_pton(AF_INET6, cases6[i], a6)) << cases6[i];
+  }
+  for (i = 0; i < sizeof(cases4) / sizeof(*cases4); i++) {
+    EXPECT_EQ(0, ares_inet_pton(AF_INET, cases4[i], a4)) << cases4[i];
+  }
+
+  // Without a prefix length, the whole destination is written.
+  memset(a6, 0x41, sizeof(a6));
+  EXPECT_EQ(1, ares_inet_pton(AF_INET6, "ffff::1", a6));
+  EXPECT_EQ("ffff:0000:0000:0000:0000:0000:0000:0001",
+            AddressToString(a6, 16));
+  memset(a6, 0x41, sizeof(a6));
+  EXPECT_EQ(1, ares_inet_pton(AF_INET6, "::ffff:1.2.3.4", a6));
+  EXPECT_EQ("0000:0000:0000:0000:0000:ffff:0102:0304",
+            AddressToString(a6, 16));
+  memset(a4, 0x41, sizeof(a4));
+  EXPECT_EQ(1, ares_inet_pton(AF_INET, "1.2.3.4", a4));
+  EXPECT_EQ("1.2.3.4", AddressToString(a4, 4));
 }
 
 TEST_F(LibraryTest, FreeCorruptData) {
@@ -1338,6 +1392,172 @@ TEST_F(LibraryTest, StrdupFailures) {
   char* copy = ares_strdup("string");
   EXPECT_EQ(nullptr, copy);
 }
+
+#ifndef WIN32
+TEST_F(FileChannelTest, GetAddrInfoHostsReplacedWithOlderMtime)
+{
+  TempFile                   hostsfile("1.2.3.4 example.com");
+  EnvValue                   with_env("CARES_HOSTS", hostsfile.filename());
+  struct ares_addrinfo_hints hints = { 0, 0, 0, 0 };
+  hints.ai_family                  = AF_INET;
+  hints.ai_flags                   = ARES_AI_ENVHOSTS | ARES_AI_NOSORT;
+
+  AddrInfoResult result1 = {};
+  ares_getaddrinfo(channel_, "example.com", NULL, &hints, AddrInfoCallback,
+                   &result1);
+  Process();
+  EXPECT_TRUE(result1.done_);
+  {
+    std::stringstream ss;
+    ss << result1.ai_;
+    EXPECT_EQ("{addr=[1.2.3.4]}", ss.str());
+  }
+
+  /* Replace the file with new content but an OLDER mtime, as produced by
+   * tar -x, cp -p, package downgrades or backup restores. */
+  {
+    FILE          *fp = fopen(hostsfile.filename(), "w");
+    struct timeval times[2];
+    ASSERT_NE(nullptr, fp);
+    fprintf(fp, "9.9.9.9 example.com");
+    fclose(fp);
+    gettimeofday(&times[0], NULL);
+    times[0].tv_sec -= 3600;
+    times[1]         = times[0];
+    ASSERT_EQ(0, utimes(hostsfile.filename(), times));
+  }
+
+  AddrInfoResult result2 = {};
+  ares_getaddrinfo(channel_, "example.com", NULL, &hints, AddrInfoCallback,
+                   &result2);
+  Process();
+  EXPECT_TRUE(result2.done_);
+  std::stringstream ss;
+  ss << result2.ai_;
+  EXPECT_EQ("{addr=[9.9.9.9]}", ss.str());
+}
+
+TEST_F(FileChannelTest, GetAddrInfoHostsReplacedWithSameMtime)
+{
+  TempFile                   hostsfile("1.2.3.4 example.com");
+  EnvValue                   with_env("CARES_HOSTS", hostsfile.filename());
+  struct ares_addrinfo_hints hints = { 0, 0, 0, 0 };
+  hints.ai_family                  = AF_INET;
+  hints.ai_flags                   = ARES_AI_ENVHOSTS | ARES_AI_NOSORT;
+
+  /* Pin the mtime a couple of seconds in the past BEFORE the first lookup,
+   * so the parse observes that mtime while the same-second re-parse
+   * heuristic (parse time vs mtime) sees a fresh file and stays out of the
+   * way. */
+  struct timeval pinned[2];
+  gettimeofday(&pinned[0], NULL);
+  pinned[0].tv_sec -= 2;
+  pinned[1]         = pinned[0];
+  ASSERT_EQ(0, utimes(hostsfile.filename(), pinned));
+
+  AddrInfoResult result1 = {};
+  ares_getaddrinfo(channel_, "example.com", NULL, &hints, AddrInfoCallback,
+                   &result1);
+  Process();
+  EXPECT_TRUE(result1.done_);
+  {
+    std::stringstream ss;
+    ss << result1.ai_;
+    EXPECT_EQ("{addr=[1.2.3.4]}", ss.str());
+  }
+
+  /* Replace the file with new content of a different length but the SAME
+   * mtime, as produced by builds that normalize file times: on NixOS,
+   * /etc/hosts is a symlink into the package store where every file
+   * carries the same mtime, so pointing the symlink at a new store path
+   * changes nothing an mtime-only check can see.  The mtime is pinned
+   * back to the exact value the cache observed, so only the size/inode
+   * identity can catch the replacement. */
+  {
+    FILE *fp = fopen(hostsfile.filename(), "w");
+    ASSERT_NE(nullptr, fp);
+    fprintf(fp, "10.11.12.13 example.com");
+    fclose(fp);
+    ASSERT_EQ(0, utimes(hostsfile.filename(), pinned));
+  }
+
+  AddrInfoResult result2 = {};
+  ares_getaddrinfo(channel_, "example.com", NULL, &hints, AddrInfoCallback,
+                   &result2);
+  Process();
+  EXPECT_TRUE(result2.done_);
+  std::stringstream ss;
+  ss << result2.ai_;
+  EXPECT_EQ("{addr=[10.11.12.13]}", ss.str());
+
+  /* Swap in a different file of the same length and the same mtime, as a
+   * symlink retarget or atomic rename does, so only the inode differs. */
+  {
+    std::string newfile = std::string(hostsfile.filename()) + ".new";
+    FILE       *fp      = fopen(newfile.c_str(), "w");
+    ASSERT_NE(nullptr, fp);
+    fprintf(fp, "10.11.12.14 example.com");
+    fclose(fp);
+    ASSERT_EQ(0, utimes(newfile.c_str(), pinned));
+    ASSERT_EQ(0, rename(newfile.c_str(), hostsfile.filename()));
+  }
+
+  AddrInfoResult result3 = {};
+  ares_getaddrinfo(channel_, "example.com", NULL, &hints, AddrInfoCallback,
+                   &result3);
+  Process();
+  EXPECT_TRUE(result3.done_);
+  std::stringstream ss3;
+  ss3 << result3.ai_;
+  EXPECT_EQ("{addr=[10.11.12.14]}", ss3.str());
+}
+
+TEST_F(FileChannelTest, GetAddrInfoHostsEmptiedInPlace)
+{
+  TempFile                   hostsfile("1.2.3.4 example.com");
+  EnvValue                   with_env("CARES_HOSTS", hostsfile.filename());
+  struct ares_addrinfo_hints hints = { 0, 0, 0, 0 };
+  hints.ai_family                  = AF_INET;
+  hints.ai_flags                   = ARES_AI_ENVHOSTS | ARES_AI_NOSORT;
+
+  /* Pin the mtime a couple of seconds in the past before the first lookup,
+   * so the same-second re-parse heuristic stays out of the way, then empty
+   * the file in place and put the mtime back: only the size can catch it,
+   * and a size of zero must still count as a real value. */
+  struct timeval pinned[2];
+  gettimeofday(&pinned[0], NULL);
+  pinned[0].tv_sec -= 2;
+  pinned[1]         = pinned[0];
+  ASSERT_EQ(0, utimes(hostsfile.filename(), pinned));
+
+  AddrInfoResult result1 = {};
+  ares_getaddrinfo(channel_, "example.com", NULL, &hints, AddrInfoCallback,
+                   &result1);
+  Process();
+  EXPECT_TRUE(result1.done_);
+  {
+    std::stringstream ss;
+    ss << result1.ai_;
+    EXPECT_EQ("{addr=[1.2.3.4]}", ss.str());
+  }
+
+  {
+    FILE *fp = fopen(hostsfile.filename(), "w");
+    ASSERT_NE(nullptr, fp);
+    fclose(fp);
+    ASSERT_EQ(0, utimes(hostsfile.filename(), pinned));
+  }
+
+  AddrInfoResult result2 = {};
+  ares_getaddrinfo(channel_, "example.com", NULL, &hints, AddrInfoCallback,
+                   &result2);
+  Process();
+  EXPECT_TRUE(result2.done_);
+  /* The channel is files only and the emptied hosts file no longer holds the
+   * name, so the lookup must fail instead of answering the stale address. */
+  EXPECT_NE(ARES_SUCCESS, result2.status_);
+}
+#endif
 
 TEST_F(FileChannelTest, GetAddrInfoHostsPositive) {
   TempFile hostsfile("1.2.3.4 example.com  \n"
@@ -1661,6 +1881,95 @@ TEST_F(FileChannelTest, GetAddrInfoAllocFail) {
       if (verbose) std::cerr << "Succeeded despite failure of alloc #" << ii << std::endl;
     }
   }
+}
+
+TEST_F(LibraryTest, DNSWriteOversizedRdlength)
+{
+  ares_dns_record_t         *dnsrec = nullptr;
+  ares_dns_rr_t             *rr     = nullptr;
+  unsigned char             *msg    = nullptr;
+  size_t                     msglen = 0;
+
+  // 300 x 255-byte character-strings = rdlength 76500 > 65535.
+  std::vector<unsigned char> str(255, 'x');
+
+  EXPECT_EQ(ARES_SUCCESS,
+            ares_dns_record_create(&dnsrec, 0x1234, 0, ARES_OPCODE_QUERY,
+                                   ARES_RCODE_NOERROR));
+  EXPECT_EQ(ARES_SUCCESS,
+            ares_dns_record_query_add(dnsrec, "example.com", ARES_REC_TYPE_TXT,
+                                      ARES_CLASS_IN));
+  EXPECT_EQ(ARES_SUCCESS, ares_dns_record_rr_add(
+                            &rr, dnsrec, ARES_SECTION_ANSWER, "example.com",
+                            ARES_REC_TYPE_TXT, ARES_CLASS_IN, 3600));
+  for (size_t i = 0; i < 300; i++) {
+    EXPECT_EQ(ARES_SUCCESS, ares_dns_rr_add_abin(rr, ARES_RR_TXT_DATA,
+                                                 str.data(), str.size()));
+  }
+
+  // rdlength does not fit in 16 bits and must not be silently truncated into
+  // a structurally corrupt message reported as ARES_SUCCESS.
+  EXPECT_EQ(ARES_EBADQUERY, ares_dns_write(dnsrec, &msg, &msglen));
+  EXPECT_EQ(nullptr, msg);
+  EXPECT_EQ(0U, msglen);
+
+  ares_dns_record_destroy(dnsrec);
+  ares_free_string(msg);
+}
+
+TEST_F(LibraryTest, DNSWriteMaximumMessageSize)
+{
+  ares_dns_record_t *dnsrec   = nullptr;
+  ares_dns_record_t *parsed   = nullptr;
+  ares_dns_rr_t     *rr       = nullptr;
+  unsigned char     *msg      = nullptr;
+  size_t             msglen   = 0;
+  size_t             overhead = 0;
+  size_t             max_data = 0;
+
+  EXPECT_EQ(ARES_SUCCESS,
+            ares_dns_record_create(&dnsrec, 0x1234, 0, ARES_OPCODE_QUERY,
+                                   ARES_RCODE_NOERROR));
+  EXPECT_EQ(ARES_SUCCESS,
+            ares_dns_record_query_add(dnsrec, "example.com", ARES_REC_TYPE_A,
+                                      ARES_CLASS_IN));
+  EXPECT_EQ(ARES_SUCCESS,
+            ares_dns_record_rr_add(&rr, dnsrec, ARES_SECTION_ANSWER, "",
+                                   ARES_REC_TYPE_RAW_RR, ARES_CLASS_IN, 0));
+  EXPECT_EQ(ARES_SUCCESS, ares_dns_rr_set_u16(rr, ARES_RR_RAW_RR_TYPE, 65432));
+
+  // Measure the fixed framing with a one-byte raw record, so the exact
+  // per-byte limit can be hit: the largest message that fits must write and
+  // parse back, and a single extra byte must be rejected.
+  EXPECT_EQ(ARES_SUCCESS, ares_dns_rr_set_bin(
+                            rr, ARES_RR_RAW_RR_DATA,
+                            reinterpret_cast<const unsigned char *>("x"), 1));
+  EXPECT_EQ(ARES_SUCCESS, ares_dns_write(dnsrec, &msg, &msglen));
+  overhead = msglen - 1; /* framing without the data byte */
+  ares_free_string(msg);
+  msg = nullptr;
+
+  max_data = 65535 - overhead;
+  std::vector<unsigned char> data(max_data, 'x');
+  EXPECT_EQ(ARES_SUCCESS, ares_dns_rr_set_bin(rr, ARES_RR_RAW_RR_DATA,
+                                              data.data(), data.size()));
+  EXPECT_EQ(ARES_SUCCESS, ares_dns_write(dnsrec, &msg, &msglen));
+  EXPECT_EQ(65535U, msglen);
+  EXPECT_EQ(ARES_SUCCESS, ares_dns_parse(msg, msglen, 0, &parsed));
+  ares_dns_record_destroy(parsed);
+  parsed = nullptr;
+  ares_free_string(msg);
+  msg = nullptr;
+
+  data.push_back('x');
+  EXPECT_EQ(ARES_SUCCESS, ares_dns_rr_set_bin(rr, ARES_RR_RAW_RR_DATA,
+                                              data.data(), data.size()));
+  EXPECT_EQ(ARES_EBADQUERY, ares_dns_write(dnsrec, &msg, &msglen));
+  EXPECT_EQ(nullptr, msg);
+  EXPECT_EQ(0U, msglen);
+
+  ares_dns_record_destroy(dnsrec);
+  ares_free_string(msg);
 }
 
 TEST_F(LibraryTest, DNSRecord) {

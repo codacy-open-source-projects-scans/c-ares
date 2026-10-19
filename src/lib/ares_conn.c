@@ -252,14 +252,30 @@ ares_conn_err_t ares_conn_read(ares_conn_t *conn, void *data, size_t len,
                            (struct sockaddr *)&sa_storage, &salen, read_bytes);
 
 #ifdef HAVE_RECVFROM
+    /* The socket is connect()ed, so the kernel normally drops datagrams from
+     * any other address or port already.  Application-provided socket
+     * functions might not filter on connect, so also check here that the
+     * datagram came from the server's address and UDP port.  RFC 5452
+     * section 9.1 only requires the address to match; matching the port too
+     * keeps one server from answering for another on the same address. */
     if (err == ARES_CONN_ERR_SUCCESS &&
-        !ares_sockaddr_addr_eq((struct sockaddr *)&sa_storage,
-                               &conn->server->addr)) {
+        !ares_sockaddr_addr_port_eq((struct sockaddr *)&sa_storage,
+                                    &conn->server->addr,
+                                    conn->server->udp_port)) {
       err = ARES_CONN_ERR_WOULDBLOCK;
     }
 #endif
   } else {
     err = ares_socket_recv(channel, conn->fd, ARES_TRUE, data, len, read_bytes);
+  }
+
+  /* The receive function is application code and may have reconfigured the
+   * servers, tearing this connection down.  Nothing read from it can be
+   * matched any more -- its queries have moved to the new configuration --
+   * and its descriptor is gone, so it must not be read again. */
+  if (conn->flags & ARES_CONN_FLAG_DEAD) {
+    *read_bytes = 0;
+    return ARES_CONN_ERR_CONNCLOSED;
   }
 
   /* Toggle connected state if needed */
@@ -408,6 +424,19 @@ ares_conn_err_t ares_conn_write(ares_conn_t *conn, const void *data, size_t len,
   }
 
 done:
+  /* The send function -- from ares_set_socket_functions_ex() or the legacy
+   * ares_set_socket_functions() -- and on the first TCP Fast Open write the
+   * getsockname function, are application code and may have reconfigured the
+   * servers, tearing this connection down.  Whatever the write returned,
+   * nothing written here can be answered any more, and the descriptor has
+   * already been closed or handed to the close notification, so there is no
+   * socket state left to report.  Say so, so every caller treats it as the
+   * connection failure it is. */
+  if (conn->flags & ARES_CONN_FLAG_DEAD) {
+    *written = 0;
+    return ARES_CONN_ERR_CONNCLOSED;
+  }
+
   if (err == ARES_CONN_ERR_SUCCESS && len == *written) {
     /* Wrote all data, make sure we're not listening for write events unless
      * using TFO, in which case we'll need a write event to know when
@@ -642,6 +671,13 @@ ares_status_t ares_open_connection(ares_conn_t   **conn_out,
   status = ares_conn_set_self_ip(conn, ARES_TRUE);
   if (status != ARES_SUCCESS) {
     goto done; /* LCOV_EXCL_LINE: UntestablePath */
+  }
+
+  /* The getsockname function is application code as well, and may have
+   * reconfigured the servers the same way. */
+  if (!ares_server_in_channel(channel, server)) {
+    status = ARES_ECONNREFUSED;
+    goto done;
   }
 
   /* TCP connections are thrown to the end as we don't spawn multiple TCP

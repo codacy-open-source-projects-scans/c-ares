@@ -188,7 +188,9 @@ static void server_increment_failures(ares_server_t *server,
   ares_timeval_t        next_retry_time;
 
   node = ares_slist_node_find(channel->servers, server);
-  if (node == NULL) {
+  /* Matches by sort key, not identity, so a removed server can match the live
+   * one that replaced it at the same configuration index. */
+  if (node == NULL || ares_slist_node_val(node) != server) {
     return; /* LCOV_EXCL_LINE: DefensiveCoding */
   }
 
@@ -219,7 +221,9 @@ static void server_set_good(ares_server_t *server, ares_bool_t used_tcp)
   const ares_channel_t *channel = server->channel;
 
   node = ares_slist_node_find(channel->servers, server);
-  if (node == NULL) {
+  /* Matches by sort key, not identity, so a removed server can match the live
+   * one that replaced it at the same configuration index. */
+  if (node == NULL || ares_slist_node_val(node) != server) {
     return; /* LCOV_EXCL_LINE: DefensiveCoding */
   }
 
@@ -500,21 +504,39 @@ void ares_process_pending_write(ares_channel_t *channel)
    */
   channel->notify_pending_write = ARES_FALSE;
 
-  for (node = ares_slist_node_first(channel->servers); node != NULL;
-       node = ares_slist_node_next(node)) {
-    ares_server_t *server = ares_slist_node_val(node);
-    ares_conn_t   *conn   = server->tcp_conn;
+  node = ares_slist_node_first(channel->servers);
+  while (node != NULL) {
+    ares_server_t *server     = ares_slist_node_val(node);
+    ares_conn_t   *conn       = server->tcp_conn;
+    size_t         generation = channel->servers_generation;
     ares_status_t  status;
 
     if (conn == NULL) {
+      node = ares_slist_node_next(node);
       continue;
     }
 
-    /* Enqueue any pending data if there is any */
+    /* Enqueue any pending data if there is any.  The flush runs the
+     * application's send function, which may have reconfigured the servers
+     * and removed this one; its connection is then already closed, which
+     * handle_conn_error() ignores. */
     status = ares_conn_flush(conn);
     if (status != ARES_SUCCESS) {
       handle_conn_error(conn, ARES_TRUE, status);
     }
+
+    /* Tearing down a connection runs the callbacks of the queries it ends,
+     * and those may reconfigure the servers too, destroying the ones the new
+     * configuration omits along with their list nodes.  A failure also moves
+     * this server further down the list.  So when either may have happened,
+     * start over from the head rather than step from this node; flushing a
+     * connection again is harmless. */
+    if (status != ARES_SUCCESS || channel->servers_generation != generation) {
+      node = ares_slist_node_first(channel->servers);
+      continue;
+    }
+
+    node = ares_slist_node_next(node);
   }
 
   ares_deferred_cb_leave(channel);
@@ -899,6 +921,13 @@ static ares_status_t process_read(ares_channel_t       *channel,
     return status;
   }
 
+  /* A later call to the receive function may have reconfigured the servers,
+   * tearing this connection down after earlier calls buffered answers on it.
+   * Its queries have moved to the new configuration, so drop the answers. */
+  if (conn->flags & ARES_CONN_FLAG_DEAD) {
+    return ARES_SUCCESS;
+  }
+
   status = read_answers(conn, now);
   if (status != ARES_SUCCESS) {
     return status;
@@ -1085,6 +1114,24 @@ static ares_status_t process_answer(ares_channel_t      *channel,
     goto cleanup;
   }
 
+  /* RFC 5452 section 9.1: only accept a response that arrives on the
+   * connection the query was sent on, and so from the server it was sent to.
+   * For UDP, ares_conn_read() also drops a datagram whose source address or
+   * port is not the server's; matching the port is hardening beyond RFC 5452
+   * section 9.1, which only requires the address to match.  Otherwise any
+   * server we hold a connection to could answer, and get cached, a query that
+   * was only ever sent to some other server, and the cookie check below would
+   * run against the wrong server's cookie state.  Treat it like an unknown
+   * query id, before anything acts on it (cookies, server health, the cache).
+   * Our caller has already consumed the message from the connection's buffer,
+   * so TCP framing stays in sync.  A query not attached to any connection
+   * (query->conn == NULL) never matches.  This also drops a late answer from
+   * a server tried before a retry. */
+  if (query->conn != conn) {
+    status = ARES_SUCCESS;
+    goto cleanup;
+  }
+
   /* Validate DNS cookie in response. This function may need to requeue the
    * query. */
   if (ares_cookie_validate(query, rdnsrec, conn, now, requeue) !=
@@ -1188,6 +1235,15 @@ static void handle_conn_error(ares_conn_t *conn, ares_bool_t critical_failure,
                               ares_status_t failure_status)
 {
   ares_server_t *server = conn->server;
+
+  /* Already torn down, most likely by a reconfiguration from application code
+   * the failing call ran, such as the send function.  Its queries have been
+   * requeued, and its server did not fail -- it was removed, or the
+   * connection was closed deliberately -- so there is nothing to record and
+   * nothing left to close. */
+  if (conn->flags & ARES_CONN_FLAG_DEAD) {
+    return;
+  }
 
   /* Increment failures first before requeue so it is unlikely to requeue
    * to the same server */
@@ -1505,6 +1561,14 @@ static ares_status_t ares_conn_query_write(ares_conn_t          *conn,
       conn->flags & ARES_CONN_FLAG_TCP) {
     channel->notify_pending_write = ARES_TRUE;
     channel->notify_pending_write_cb(channel->notify_pending_write_cb_data);
+
+    /* The callback is application code and may have reconfigured the
+     * servers, closing this connection with the query already buffered on
+     * it.  Report it as a connection failure so the query is requeued rather
+     * than attached to the closed connection. */
+    if (conn->flags & ARES_CONN_FLAG_DEAD) {
+      return ARES_ECONNREFUSED;
+    }
     return ARES_SUCCESS;
   }
 
@@ -1647,6 +1711,11 @@ static ares_status_t ares_send_query_int(ares_server_t        *requested_server,
     return ARES_ECANCELLED;
   }
 
+  /* Application code that tore this connection down during the write -- the
+   * send function, or the pending-write callback when the write is deferred,
+   * reconfiguring the servers, say -- surfaces here as ARES_ECONNREFUSED,
+   * even if the send itself reported success or never happened, so the query
+   * is requeued below rather than attached to the closed connection. */
   switch (status) {
     /* Good result, continue on */
     case ARES_SUCCESS:
